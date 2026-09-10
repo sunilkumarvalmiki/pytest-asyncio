@@ -115,8 +115,7 @@ def test_default_package_loop_scope_config_option_changes_fixture_loop_scope(
 
 def test_warns_when_fixture_and_test_loop_scopes_differ(pytester: Pytester):
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
-    pytester.makepyfile(
-        dedent("""\
+    pytester.makepyfile(dedent("""\
             import pytest
             import pytest_asyncio
 
@@ -127,8 +126,7 @@ def test_warns_when_fixture_and_test_loop_scopes_differ(pytester: Pytester):
             @pytest.mark.asyncio(loop_scope="function")
             async def test_mismatched_loop_scope(fixture):
                 pass
-            """)
-    )
+            """))
     result = pytester.runpytest(
         "--asyncio-mode=strict", "-W", "default::pytest.PytestWarning"
     )
@@ -140,8 +138,7 @@ def test_warns_when_fixture_and_test_loop_scopes_differ(pytester: Pytester):
 
 def test_warns_when_async_fixtures_request_different_loop_scopes(pytester: Pytester):
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
-    pytester.makepyfile(
-        dedent("""\
+    pytester.makepyfile(dedent("""\
             import pytest
             import pytest_asyncio
 
@@ -156,8 +153,7 @@ def test_warns_when_async_fixtures_request_different_loop_scopes(pytester: Pytes
             @pytest.mark.asyncio(loop_scope="session")
             async def test_mismatched_fixture_scopes(outer_fixture):
                 pass
-            """)
-    )
+            """))
     result = pytester.runpytest(
         "--asyncio-mode=strict", "-W", "default::pytest.PytestWarning"
     )
@@ -165,6 +161,87 @@ def test_warns_when_async_fixtures_request_different_loop_scopes(pytester: Pytes
     result.stdout.fnmatch_lines(
         "*Async fixture 'inner_fixture' with loop_scope='function' is requested "
         "by fixture 'outer_fixture'*"
+    )
+
+
+@pytest.mark.parametrize("asyncio_mode", ("auto", "strict"))
+def test_warns_when_fixture_and_test_loop_scopes_differ_in_auto_mode(
+    pytester: Pytester, asyncio_mode: str
+):
+    """The warning must fire in auto mode too, where the test has no explicit asyncio marker."""
+    pytester.makeini(
+        f"[pytest]\nasyncio_mode = {asyncio_mode}\nasyncio_default_fixture_loop_scope = function"
+    )
+    pytester.makepyfile(dedent("""\
+            import pytest_asyncio
+
+            @pytest_asyncio.fixture(loop_scope="session")
+            async def fixture():
+                pass
+
+            async def test_mismatched_loop_scope(fixture):
+                pass
+            """))
+    result = pytester.runpytest(
+        "--asyncio-mode", asyncio_mode, "-W", "default::pytest.PytestWarning"
+    )
+    result.assert_outcomes(passed=1, warnings=1)
+    result.stdout.fnmatch_lines(
+        "*Async fixture 'fixture' with loop_scope='session' is requested by test*"
+    )
+
+
+def test_warns_regardless_of_fixture_request_order(pytester: Pytester):
+    """The warning must not depend on test order: it fires for every request,
+    not just the first one that happens to create the fixture."""
+    pytester.makeini(
+        "[pytest]\nasyncio_mode = auto\nasyncio_default_fixture_loop_scope = function"
+    )
+    pytester.makepyfile(dedent("""\
+            import pytest_asyncio
+
+            @pytest_asyncio.fixture(loop_scope="function")
+            async def fixture():
+                pass
+
+            @pytest.mark.asyncio(loop_scope="session")
+            async def test_fixture_is_created_first(fixture):
+                pass
+            """))
+    # First run: the mismatched test is the only request, so the fixture is
+    # created (and warned) by it.
+    result = pytester.runpytest(
+        "--asyncio-mode=auto", "-W", "default::pytest.PytestWarning"
+    )
+    result.assert_outcomes(passed=1, warnings=1)
+    result.stdout.fnmatch_lines(
+        "*Async fixture 'fixture' with loop_scope='function' is requested by test*"
+    )
+
+    # Second run: a matching test creates the fixture first; the mismatched
+    # test then reuses the cached value and must STILL warn.
+    pytester.makepyfile(dedent("""\
+            import pytest
+            import pytest_asyncio
+
+            @pytest_asyncio.fixture(loop_scope="function")
+            async def fixture():
+                pass
+
+            @pytest.mark.asyncio(loop_scope="function")
+            async def test_matching_loop_scope_first(fixture):
+                pass
+
+            @pytest.mark.asyncio(loop_scope="session")
+            async def test_mismatched_loop_scope(fixture):
+                pass
+            """))
+    result = pytester.runpytest(
+        "--asyncio-mode=auto", "-W", "default::pytest.PytestWarning"
+    )
+    result.assert_outcomes(passed=2, warnings=1)
+    result.stdout.fnmatch_lines(
+        "*Async fixture 'fixture' with loop_scope='function' is requested by test*"
     )
 
 

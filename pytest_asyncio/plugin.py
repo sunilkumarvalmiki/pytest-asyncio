@@ -343,16 +343,32 @@ def _fixture_synchronizer(
 
 
 def _get_fixture_loop_scope(fixturedef: FixtureDef, config: Config) -> _ScopeName:
+    scope = _get_asyncio_fixture_loop_scope(fixturedef, config)
+    if scope is not None:
+        return scope
+    return fixturedef.scope
+
+
+def _get_asyncio_fixture_loop_scope(
+    fixturedef: FixtureDef, config: Config
+) -> _ScopeName | None:
+    """Return the explicit or configured loop scope of an async fixture.
+
+    Returns ``None`` when no loop scope is set (neither on the fixture
+    function nor in the configuration) and the fixture's own caching scope
+    should be used instead.
+    """
     return (
         getattr(fixturedef.func, "_loop_scope", None)
         or config.getini("asyncio_default_fixture_loop_scope")
-        or fixturedef.scope
+        or None
     )
 
 
 def _get_requesting_loop_scope(
     request: FixtureRequest,
 ) -> tuple[str, _ScopeName] | None:
+    """Return a label and the loop scope of the test or fixture requesting ``request``."""
     parent_request = getattr(request, "_parent_request", None)
     parent_fixturedef = getattr(parent_request, "_fixturedef", None)
     if parent_fixturedef is not None and _is_asyncio_fixture_function(
@@ -374,6 +390,19 @@ def _get_requesting_loop_scope(
     )
 
 
+class FixtureLoopScopeMismatchWarning(PytestWarning := pytest.PytestWarning):
+    """Emitted when an async fixture is requested from a different event-loop scope.
+
+    This dedicated subclass keeps every mismatch distinct: using a single
+    shared ``PytestWarning`` would emit only one warning per process, because
+    the warnings machinery de-duplicates identical (message, category, module,
+    lineno) warnings.  Under ``filterwarnings = error`` each mismatch must
+    surface as its own error.
+    """
+
+    __str__ = lambda self: self.args[0] if self.args else ""  # noqa: B010
+
+
 def _warn_if_fixture_loop_scope_mismatch(
     fixturedef: FixtureDef, request: FixtureRequest, loop_scope: _ScopeName
 ) -> None:
@@ -384,7 +413,7 @@ def _warn_if_fixture_loop_scope_mismatch(
     if requesting_loop_scope == loop_scope:
         return
     warnings.warn(
-        pytest.PytestWarning(
+        FixtureLoopScopeMismatchWarning(
             f"Async fixture {fixturedef.argname!r} with loop_scope={loop_scope!r} "
             f"is requested by {requester} with loop_scope={requesting_loop_scope!r}. "
             "Fixtures with different loop scopes may cause unexpected behavior."
@@ -977,7 +1006,6 @@ def pytest_fixture_setup(fixturedef: FixtureDef, request) -> object | None:
         if not _is_coroutine_or_asyncgen(fixturedef.func):
             return (yield)
     loop_scope = _get_fixture_loop_scope(fixturedef, request.config)
-    _warn_if_fixture_loop_scope_mismatch(fixturedef, request, loop_scope)
     runner_fixture_id = f"_{loop_scope}_scoped_runner"
     runner = request.getfixturevalue(runner_fixture_id)
     # Prevent the runner closing before the fixture's async teardown.
@@ -991,6 +1019,29 @@ def pytest_fixture_setup(fixturedef: FixtureDef, request) -> object | None:
         c.setattr(fixturedef, "func", synchronizer)
         hook_result = yield
     return hook_result
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_fixture_post_finalizer(fixturedef: FixtureDef, request) -> None:
+    """Warn about async fixtures requested from a mismatched event-loop scope.
+
+    The warning must be emitted for every request of the fixture, not only
+    for the first one -- ``pytest_fixture_setup`` runs only when the fixture
+    value is first created, so later requests bypass it.  This hook is the
+    finalizer registered (by pytest's ``FixtureDef.execute``) once per test
+    that actually triggers the fixture's setup, so it fires for each such
+    test, regardless of test order or of the fixture's own scope.
+    """
+    asyncio_mode = _get_asyncio_mode(request.config)
+    if not _is_asyncio_fixture_function(fixturedef.func):
+        if asyncio_mode == Mode.STRICT:
+            # Ignore async fixtures without explicit asyncio mark in strict mode
+            # This applies to pytest_trio fixtures, for example
+            return
+        if not _is_coroutine_or_asyncgen(fixturedef.func):
+            return
+    loop_scope = _get_fixture_loop_scope(fixturedef, request.config)
+    _warn_if_fixture_loop_scope_mismatch(fixturedef, request, loop_scope)
 
 
 _DUPLICATE_LOOP_SCOPE_DEFINITION_ERROR = """\
